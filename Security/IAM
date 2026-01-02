@@ -1,0 +1,569 @@
+import boto3
+import datetime
+import openpyxl
+import json
+import os
+import concurrent.futures
+import pytz
+from openpyxl.styles import Font, PatternFill, Alignment
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def convert_to_ist(utc_time):
+    """Convert UTC time to Indian Standard Time (IST)"""
+    if not utc_time:
+        return "N/A"
+    
+    try:
+        utc_zone = pytz.utc
+        ist_zone = pytz.timezone('Asia/Kolkata')
+        
+        if utc_time.tzinfo is None:
+            utc_time = utc_zone.localize(utc_time)
+        
+        ist_time = utc_time.astimezone(ist_zone)
+        return ist_time.strftime('%Y-%m-%d %H:%M:%S IST')
+    except Exception:
+        return "N/A"
+
+def get_user_stats(iam_client, username, current_time_utc, ninety_days_ago):
+    """Get detailed statistics for a single user (parallel processing)"""
+    try:
+        user_details = iam_client.get_user(UserName=username)
+        password_last_used = user_details.get('User', {}).get('PasswordLastUsed')
+        
+        # MFA status
+        mfa_devices = iam_client.list_mfa_devices(UserName=username)['MFADevices']
+        mfa_enabled = len(mfa_devices) > 0
+        
+        # Never logged in
+        never_logged_in = password_last_used is None
+        
+        # Active within 90 days
+        active_within_90_days = False
+        if password_last_used:
+            if password_last_used.tzinfo is None:
+                password_last_used = pytz.utc.localize(password_last_used)
+            active_within_90_days = password_last_used >= ninety_days_ago
+        
+        # Admin status
+        managed_policies = [policy['PolicyName'] for policy in iam_client.list_attached_user_policies(UserName=username)['AttachedPolicies']]
+        groups = iam_client.list_groups_for_user(UserName=username)['Groups']
+        group_policies = []
+        for group in groups:
+            group_policies += [policy['PolicyName'] for policy in iam_client.list_attached_group_policies(GroupName=group['GroupName'])['AttachedPolicies']]
+        
+        is_admin = 'AdministratorAccess' in managed_policies or 'AdministratorAccess' in group_policies
+        
+        # Old access keys
+        access_keys = iam_client.list_access_keys(UserName=username)['AccessKeyMetadata']
+        old_keys_count = 0
+        for key in access_keys:
+            key_create_date = key['CreateDate']
+            if key_create_date.tzinfo is None:
+                key_create_date = pytz.utc.localize(key_create_date)
+            if (current_time_utc - key_create_date).days >= 90:
+                old_keys_count += 1
+        
+        # Inactive user (not logged in for >90 days)
+        inactive = False
+        if password_last_used and not never_logged_in:
+            if password_last_used.tzinfo is None:
+                password_last_used = pytz.utc.localize(password_last_used)
+            inactive = (current_time_utc - password_last_used).days > 90
+        
+        return {
+            'mfa_enabled': mfa_enabled,
+            'never_logged_in': never_logged_in,
+            'active_within_90_days': active_within_90_days,
+            'is_admin': is_admin,
+            'old_keys_count': old_keys_count,
+            'inactive': inactive
+        }
+    except Exception:
+        return {
+            'mfa_enabled': False,
+            'never_logged_in': False,
+            'active_within_90_days': False,
+            'is_admin': False,
+            'old_keys_count': 0,
+            'inactive': False
+        }
+
+def get_iam_users_report(account_name, access_key, secret_key, output_path):
+    """Generate IAM report for a single account"""
+    try:
+        session = boto3.session.Session(
+            aws_access_key_id=access_key, 
+            aws_secret_access_key=secret_key
+        )
+        iam = session.client('iam')
+        users = iam.list_users()['Users']
+        
+        current_time_utc = datetime.datetime.now(pytz.utc)
+        ninety_days_ago = current_time_utc - datetime.timedelta(days=90)
+        sixty_days_ago = current_time_utc - datetime.timedelta(days=60)
+        
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "IAM Users Report"
+        
+        # Define styles
+        header_font = Font(name='Times New Roman', size=12, bold=True, color='FFFFFF')
+        normal_font = Font(name='Times New Roman', size=11)
+        warning_font = Font(name='Times New Roman', size=11, color='FFA500', bold=True)  # Orange
+        red_font = Font(name='Times New Roman', size=11, color='FF0000', bold=True)
+        green_font = Font(name='Times New Roman', size=11, color='008000', bold=True)
+        
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        orange_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+        
+        center_alignment = Alignment(horizontal='center', vertical='center')
+        
+        headers = [
+            'S.No', 'UserName', 'PasswordAge(Days)', 'LastLoginDate (IST)', 'ActiveWithin90Days', 'NeverLoggedIn',
+            'MFAEnabled', 'ConsoleAccess', 'InlinePolicies', 'ManagedPolicies', 'GroupName', 'GroupPolicies', 
+            'AccessKey1Age', 'AccessKey2Age', 'FullAdminAccess'
+        ]
+        
+        sheet.append(headers)
+        
+        # Apply header formatting
+        for col_num in range(1, len(headers) + 1):
+            cell = sheet.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_alignment
+        
+        serial_number = 1
+        users_with_issues = 0
+        
+        for user in users:
+            username = user['UserName']
+            user_details = iam.get_user(UserName=username)
+            password_last_used_utc = user_details.get('User', {}).get('PasswordLastUsed')
+            created_date_utc = user_details.get('User', {}).get('CreateDate')
+            
+            # Convert to IST for display
+            last_login_ist = convert_to_ist(password_last_used_utc)
+            
+            # Calculate password age
+            password_age_days = 'N/A'
+            if created_date_utc:
+                if created_date_utc.tzinfo is None:
+                    created_date_utc = pytz.utc.localize(created_date_utc)
+                password_age_days = (current_time_utc - created_date_utc).days
+            
+            # CORRECTED: Active within 90 days logic
+            active_within_90_days = '✗'  # Default to inactive
+            never_logged_in = 'Yes'  # Default to never logged in
+            
+            if password_last_used_utc:
+                # User has logged in at least once
+                never_logged_in = 'No'
+                
+                if password_last_used_utc.tzinfo is None:
+                    password_last_used_utc = pytz.utc.localize(password_last_used_utc)
+                
+                # User is active if they logged in within the last 90 days
+                if password_last_used_utc >= ninety_days_ago:
+                    active_within_90_days = '✓'
+                else:
+                    active_within_90_days = '✗'
+            
+            # Check MFA
+            mfa_devices = iam.list_mfa_devices(UserName=username)['MFADevices']
+            mfa_enabled = '✓' if len(mfa_devices) > 0 else '✗'
+            
+            # Get policies
+            inline_policies = iam.list_user_policies(UserName=username)['PolicyNames']
+            managed_policies = [policy['PolicyName'] for policy in iam.list_attached_user_policies(UserName=username)['AttachedPolicies']]
+            
+            # Get groups and group policies
+            groups = iam.list_groups_for_user(UserName=username)['Groups']
+            group_policies = []
+            group_names = []
+            for group in groups:
+                group_names.append(group['GroupName'])
+                group_policies += [policy['PolicyName'] for policy in iam.list_attached_group_policies(GroupName=group['GroupName'])['AttachedPolicies']]
+            
+            if not group_names:
+                group_names.append('N/A')
+            if not group_policies:
+                group_policies.append('N/A')
+            
+            # Check for admin access
+            full_admin = 'Yes' if 'AdministratorAccess' in managed_policies or 'AdministratorAccess' in group_policies else 'No'
+            
+            # Check console access
+            try:
+                iam.get_login_profile(UserName=username)
+                console_access = '✓'
+            except iam.exceptions.NoSuchEntityException:
+                console_access = '✗'
+            
+            # Get access key ages
+            access_keys = iam.list_access_keys(UserName=username)['AccessKeyMetadata']
+            access_key_ages = []
+            for key in access_keys:
+                key_create_date = key['CreateDate']
+                if key_create_date.tzinfo is None:
+                    key_create_date = pytz.utc.localize(key_create_date)
+                key_age = (current_time_utc - key_create_date).days
+                access_key_ages.append(key_age)
+            
+            # Pad with N/A if less than 2 keys
+            while len(access_key_ages) < 2:
+                access_key_ages.append('N/A')
+            
+            # Prepare row data
+            row = [
+                serial_number, username, password_age_days, last_login_ist, active_within_90_days, never_logged_in,
+                mfa_enabled, console_access, ', '.join(inline_policies), ', '.join(managed_policies), 
+                ', '.join(group_names), ', '.join(group_policies),
+                access_key_ages[0], access_key_ages[1], full_admin
+            ]
+            
+            sheet.append(row)
+            
+            last_row = sheet.max_row
+            
+            # Apply cell formatting
+            for col_num in range(1, len(headers) + 1):
+                cell = sheet.cell(row=last_row, column=col_num)
+                cell.font = normal_font
+                cell.alignment = center_alignment
+            
+            # Apply conditional formatting
+            
+            # Password Age formatting (60-90 days: orange, >90 days: red)
+            if isinstance(password_age_days, int):
+                password_cell = sheet.cell(row=last_row, column=3)
+                if password_age_days > 90:
+                    password_cell.font = red_font
+                    users_with_issues += 1
+                elif password_age_days >= 60:
+                    password_cell.font = warning_font
+                    users_with_issues += 1
+            
+            # Active within 90 days - CORRECTED COLOR CODING
+            active_cell = sheet.cell(row=last_row, column=5)
+            if active_within_90_days == '✓':
+                active_cell.font = green_font
+            else:
+                active_cell.font = red_font
+                users_with_issues += 1  # Count as issue if not active
+            
+            # Never logged in
+            if never_logged_in == 'Yes':
+                sheet.cell(row=last_row, column=6).font = red_font
+                users_with_issues += 1
+            
+            # MFA disabled
+            if mfa_enabled == '✗':
+                sheet.cell(row=last_row, column=7).font = red_font
+                users_with_issues += 1
+            
+            # Console access
+            console_cell = sheet.cell(row=last_row, column=8)
+            if console_access == '✓':
+                console_cell.font = green_font
+            else:
+                console_cell.font = red_font
+            
+            # Admin access
+            if full_admin == 'Yes':
+                admin_cell = sheet.cell(row=last_row, column=15)
+                admin_cell.fill = red_fill
+                admin_cell.font = Font(name='Times New Roman', size=11, color='FFFFFF', bold=True)
+                users_with_issues += 1
+            
+            # Access key age formatting
+            for i, key_age in enumerate([access_key_ages[0], access_key_ages[1]], start=13):
+                if isinstance(key_age, int):
+                    key_cell = sheet.cell(row=last_row, column=i)
+                    if key_age >= 90:
+                        key_cell.font = red_font
+                        users_with_issues += 1
+                    elif key_age >= 60:
+                        key_cell.font = warning_font
+                        users_with_issues += 1
+            
+            serial_number += 1
+        
+        # Add summary sheet
+        summary_sheet = workbook.create_sheet("Summary")
+        
+        # Summary headers
+        summary_headers = ['Metric', 'Count', 'Status']
+        summary_sheet.append(summary_headers)
+        
+        for col_num in range(1, len(summary_headers) + 1):
+            cell = summary_sheet.cell(row=1, column=col_num)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_alignment
+        
+        # Get detailed statistics in parallel
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = []
+            for user in users:
+                futures.append(executor.submit(get_user_stats, iam, user['UserName'], current_time_utc, ninety_days_ago))
+            
+            mfa_disabled = 0
+            never_logged_in = 0
+            admin_users = 0
+            old_access_keys = 0
+            inactive_users = 0
+            not_active_90_days = 0
+            
+            for future in concurrent.futures.as_completed(futures):
+                stats = future.result()
+                mfa_disabled += 1 if not stats['mfa_enabled'] else 0
+                never_logged_in += 1 if stats['never_logged_in'] else 0
+                admin_users += 1 if stats['is_admin'] else 0
+                old_access_keys += stats['old_keys_count']
+                inactive_users += 1 if stats['inactive'] else 0
+                not_active_90_days += 1 if not stats['active_within_90_days'] else 0
+        
+        summary_data = [
+            ['Total Users', len(users), ''],
+            ['Users with MFA Disabled', mfa_disabled, '⚠️' if mfa_disabled > 0 else '✓'],
+            ['Users Never Logged In', never_logged_in, '⚠️' if never_logged_in > 0 else '✓'],
+            ['Users Not Active Within 90 Days', not_active_90_days, '⚠️' if not_active_90_days > 0 else '✓'],
+            ['Admin Users', admin_users, '⚠️'],
+            ['Users with Old Access Keys (>90 days)', old_access_keys, '⚠️' if old_access_keys > 0 else '✓'],
+            ['Inactive Users (>90 days since last login)', inactive_users, '⚠️' if inactive_users > 0 else '✓'],
+            ['Users with Password Age >90 days', len([1 for user in users if ((created_date := iam.get_user(UserName=user['UserName']).get('User', {}).get('CreateDate')) and (current_time_utc - (created_date if created_date.tzinfo else pytz.utc.localize(created_date))).days > 90)]), '⚠️' if len([1 for user in users if ((created_date := iam.get_user(UserName=user['UserName']).get('User', {}).get('CreateDate')) and (current_time_utc - (created_date if created_date.tzinfo else pytz.utc.localize(created_date))).days > 90)]) > 0 else '✓']
+        ]
+        
+        for i, data in enumerate(summary_data, start=2):
+            summary_sheet.cell(row=i, column=1, value=data[0]).font = normal_font
+            summary_sheet.cell(row=i, column=2, value=data[1]).font = normal_font
+            status_cell = summary_sheet.cell(row=i, column=3, value=data[2])
+            status_cell.font = normal_font
+            if '⚠️' in data[2]:
+                status_cell.font = red_font
+        
+        # Add recommendations
+        summary_sheet.cell(row=len(summary_data) + 3, column=1, value="RECOMMENDATIONS:").font = Font(name='Times New Roman', size=12, bold=True)
+        recommendations = [
+            "1. Enable MFA for all users immediately",
+            "2. Rotate passwords older than 90 days",
+            "3. Remove users not active within 90 days",
+            "4. Review admin privileges regularly",
+            "5. Rotate access keys older than 90 days",
+            "6. Implement IAM password policies",
+            "7. Use IAM roles instead of long-term credentials"
+        ]
+        
+        for i, rec in enumerate(recommendations, start=len(summary_data) + 4):
+            summary_sheet.cell(row=i, column=1, value=rec).font = normal_font
+        
+        # Set column widths
+        column_widths = [8, 25, 18, 25, 18, 15, 12, 15, 30, 30, 25, 30, 15, 15, 15]
+        for i, width in enumerate(column_widths, start=1):
+            sheet.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+        
+        summary_sheet.column_dimensions['A'].width = 35
+        summary_sheet.column_dimensions['B'].width = 15
+        summary_sheet.column_dimensions['C'].width = 15
+        
+        workbook.save(output_path)
+        
+        return True, len(users), users_with_issues, output_path
+        
+    except Exception as e:
+        print(f"    ✗ Error generating IAM report: {e}")
+        return False, 0, 0, None
+
+def load_accounts(filename='accounts.json'):
+    """Load AWS accounts from JSON file"""
+    try:
+        with open(filename) as f:
+            accounts = json.load(f)
+            if not isinstance(accounts, list):
+                print("Error: accounts.json should contain a list of accounts")
+                return []
+            valid_accounts = []
+            for account in accounts:
+                if not all(k in account for k in ['name', 'access_key', 'secret_key']):
+                    print(f"Account {account.get('name', 'unknown')} missing required fields")
+                    continue
+                valid_accounts.append(account)
+            return valid_accounts
+    except Exception as e:
+        print(f"Error loading accounts: {str(e)}")
+        return []
+
+def select_accounts(accounts):
+    """Display numbered list of accounts and let user select which ones to process"""
+    if not accounts:
+        return []
+    
+    print("\n" + "="*60)
+    print("AVAILABLE AWS ACCOUNTS")
+    print("="*60)
+    
+    for i, account in enumerate(accounts, 1):
+        print(f"{i}. {account['name']}")
+    
+    print("\n" + "="*60)
+    print("SELECT ACCOUNTS TO PROCESS")
+    print("="*60)
+    print("Enter account numbers separated by commas (e.g., 1,3,5)")
+    print("Enter 'all' to process all accounts (default)")
+    print("Enter 'none' to skip all accounts")
+    
+    while True:
+        selection = input("\nYour selection [all]: ").strip().lower()
+        
+        if selection == '' or selection == 'all':
+            print("\nSelected ALL accounts")
+            return accounts
+        elif selection == 'none':
+            return []
+        elif selection:
+            try:
+                selected_indices = [int(idx.strip()) for idx in selection.split(',')]
+                selected_accounts = []
+                invalid_selections = []
+                
+                for idx in selected_indices:
+                    if 1 <= idx <= len(accounts):
+                        selected_accounts.append(accounts[idx-1])
+                    else:
+                        invalid_selections.append(idx)
+                
+                if invalid_selections:
+                    print(f"Warning: Invalid account numbers ignored: {invalid_selections}")
+                
+                if selected_accounts:
+                    print(f"\nSelected {len(selected_accounts)} account(s):")
+                    for account in selected_accounts:
+                        print(f"  - {account['name']}")
+                    return selected_accounts
+                else:
+                    print("No valid accounts selected. Please try again.")
+            except ValueError:
+                print("Invalid input. Please enter numbers separated by commas.")
+        else:
+            print("No input received. Please enter your selection.")
+
+def process_account_iam(account, output_base_dir):
+    """Process IAM audit for a single account"""
+    account_name = account['name']
+    print(f"\n🔍 Processing IAM audit for account: {account_name}")
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(output_base_dir, f"{account_name.replace(' ', '_')}_IAM_Audit_{timestamp}.xlsx")
+    
+    success, total_users, users_with_issues, report_path = get_iam_users_report(
+        account_name, account['access_key'], account['secret_key'], filename
+    )
+    
+    if success:
+        print(f"  ✅ Generated report: {report_path}")
+        print(f"  📊 Found {total_users} IAM users ({users_with_issues} with issues)")
+        return True, account_name, total_users, users_with_issues, report_path
+    else:
+        print("  ❌ Failed to generate IAM report")
+        return False, account_name, 0, 0, None
+
+def main():
+    print(f"Starting AWS IAM Audit at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*70)
+    
+    # Load accounts
+    accounts = load_accounts('accounts.json')
+    if not accounts:
+        print("No accounts found to process")
+        return
+    
+    # Select accounts (default: all)
+    selected_accounts = select_accounts(accounts)
+    if not selected_accounts:
+        print("No accounts selected. Exiting.")
+        return
+    
+    # Create timestamped reports directory
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    reports_dir = os.path.join("reports", f"iam_audit_{timestamp}")
+    os.makedirs(reports_dir, exist_ok=True)
+    
+    print(f"\n" + "="*60)
+    print(f"PROCESSING {len(selected_accounts)} SELECTED ACCOUNT(S)")
+    print(f"Reports will be saved to: {reports_dir}")
+    print("="*60)
+    
+    # Process accounts in parallel with more workers
+    worker_count = min(10, len(selected_accounts))  # Increased to 10 workers
+    print(f"\nProcessing accounts with {worker_count} workers...")
+    
+    results = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_account = {
+            executor.submit(process_account_iam, account, reports_dir): account['name']
+            for account in selected_accounts
+        }
+        
+        for future in as_completed(future_to_account):
+            account_name = future_to_account[future]
+            try:
+                success, processed_name, total_users, users_with_issues, report_path = future.result()
+                results.append({
+                    'account': processed_name,
+                    'success': success,
+                    'total_users': total_users,
+                    'users_with_issues': users_with_issues,
+                    'report_path': report_path
+                })
+            except Exception as e:
+                print(f"Error processing account {account_name}: {e}")
+                results.append({
+                    'account': account_name,
+                    'success': False,
+                    'total_users': 0,
+                    'users_with_issues': 0,
+                    'report_path': None,
+                    'error': str(e)
+                })
+    
+    # Print summary
+    print(f"\n" + "="*60)
+    print("IAM AUDIT COMPLETE - SUMMARY")
+    print("="*60)
+    
+    total_audited_users = 0
+    total_users_with_issues = 0
+    successful_accounts = 0
+    
+    for result in results:
+        if result['success']:
+            print(f"✅ {result['account']}: {result['total_users']} users ({result['users_with_issues']} with issues)")
+            total_audited_users += result['total_users']
+            total_users_with_issues += result['users_with_issues']
+            successful_accounts += 1
+        else:
+            print(f"❌ {result['account']}: Failed to process")
+    
+    print(f"\n📊 FINAL SUMMARY:")
+    print(f"   Processed accounts: {successful_accounts}/{len(selected_accounts)}")
+    print(f"   Total IAM users audited: {total_audited_users}")
+    print(f"   Users with security issues: {total_users_with_issues}")
+    print(f"   Reports saved to: {reports_dir}")
+    
+    print(f"\n🔐 SECURITY RECOMMENDATIONS:")
+    print("   1. Enable MFA for all users immediately")
+    print("   2. Rotate passwords older than 90 days (RED)")
+    print("   3. Review passwords 60-90 days old (ORANGE)")
+    print("   4. Remove users not active within 90 days")
+    print("   5. Review admin privileges regularly")
+    print("   6. Rotate access keys older than 90 days")
+    print("   7. Implement IAM password policies")
+    print("   8. Use IAM roles instead of long-term credentials")
+    
+    print(f"\n✅ IAM Audit completed at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+if __name__ == "__main__":
+    main()
